@@ -230,6 +230,13 @@ class GarminBulkExport:
                 key = f"hrTimeInZone_{zone}"
                 if a.get(key) is not None:
                     a[key] = a[key] / 1000
+            # The extra ActivitySummary fields (power, running dynamics, fastest
+            # splits, local start time...) have not been checked against the units
+            # and formats of a bulk export: leave them empty rather than write
+            # values in the wrong unit.
+            import garmin_fetch
+            for key in garmin_fetch.ACTIVITY_SUMMARY_EXTRA_FIELDS:
+                a.pop(key, None)
         logging.info("Loading %d activities", len(activities))
         return sorted(activities, key=lambda o: o["startTimeGMT"])
 

@@ -59,7 +59,7 @@ MAX_CONSECUTIVE_500_ERRORS = int(os.getenv("MAX_CONSECUTIVE_500_ERRORS", 10)) # 
 INFLUXDB_ENDPOINT_IS_HTTP = False if os.getenv("INFLUXDB_ENDPOINT_IS_HTTP") in ['False','false','FALSE','f','F','no','No','NO','0'] else True # optional
 GARMIN_DEVICENAME_AUTOMATIC = False if GARMIN_DEVICENAME != "Unknown" else True # optional
 UPDATE_INTERVAL_SECONDS = int(os.getenv("UPDATE_INTERVAL_SECONDS", 300)) # optional
-FETCH_SELECTION = os.getenv("FETCH_SELECTION", "daily_avg,sleep,steps,heartrate,stress,breathing,hrv,fitness_age,vo2,activity,race_prediction,body_composition,lifestyle") # additional available values are lactate_threshold,training_status,training_readiness,hill_score,endurance_score,blood_pressure,hydration,solar_intensity,cycling_dynamics which you can add to the list seperated by , without any space
+FETCH_SELECTION = os.getenv("FETCH_SELECTION", "daily_avg,sleep,steps,heartrate,stress,breathing,hrv,fitness_age,vo2,activity,race_prediction,body_composition,lifestyle") # additional available values are lactate_threshold,training_status,training_readiness,hill_score,endurance_score,blood_pressure,hydration,solar_intensity,cycling_dynamics,activity_details (one extra request per activity: feel, RPE, min HR, time zone, race goal) which you can add to the list seperated by , without any space
 ACTIVITY_TYPE_FILTER = [t.strip().lower() for t in os.getenv("ACTIVITY_TYPE_FILTER", "").split(",") if t.strip()] # optional, comma-separated list of activity typeKeys to import only specific activity types. Leave empty to import all. Known typeKeys: running,treadmill_running,indoor_running,cycling,indoor_cycling,road_biking,mountain_biking,walking,hiking,mountaineering,strength_training,hiit,indoor_cardio,elliptical,lap_swimming,open_water_swimming,rock_climbing,indoor_climbing,tennis_v2,kayaking_v2,boating_v2,multi_sport,other
 LACTATE_THRESHOLD_SPORTS = os.getenv("LACTATE_THRESHOLD_SPORTS", "RUNNING").upper().split(",") # Garmin currently implements RUNNING, but has provisions for CYCLING, and SWIMMING
 KEEP_FIT_FILES = True if os.getenv("KEEP_FIT_FILES") in ['True', 'true', 'TRUE','t', 'T', 'yes', 'Yes', 'YES', '1'] else False # optional
@@ -728,6 +728,114 @@ def get_activity_event_type(activity):
         return event_type
     return None
 
+def _as_float(value):
+    """Return value as float (fixed InfluxDB field type), None if missing or not numeric."""
+    try:
+        return float(value) if value is not None and not isinstance(value, bool) else None
+    except (TypeError, ValueError):
+        return None
+
+def _as_int(value):
+    """Return value as int (fixed InfluxDB field type), None if missing or not numeric."""
+    number = _as_float(value)
+    return int(round(number)) if number is not None else None
+
+def _as_str(value):
+    return str(value) if value is not None and value != "" else None
+
+def _as_bool(value):
+    return bool(value) if value is not None else None
+
+# Fields of the activity list (get_activities_by_date) written on the ActivitySummary
+# start point, in addition to the historical ones. Types are fixed so that a value
+# returned as 0 (int) one day and 0.5 (float) another never causes a field type conflict.
+ACTIVITY_SUMMARY_EXTRA_FIELDS = {
+    'startTimeLocal': _as_str,
+    'steps': _as_int,
+    'averageRunningCadenceInStepsPerMinute': _as_float,
+    'maxRunningCadenceInStepsPerMinute': _as_float,
+    'avgPower': _as_float,
+    'maxPower': _as_float,
+    'normPower': _as_float,
+    'powerTimeInZone_1': _as_float,
+    'powerTimeInZone_2': _as_float,
+    'powerTimeInZone_3': _as_float,
+    'powerTimeInZone_4': _as_float,
+    'powerTimeInZone_5': _as_float,
+    'avgGradeAdjustedSpeed': _as_float,
+    'avgGroundContactTime': _as_float,
+    'avgStrideLength': _as_float,
+    'avgVerticalOscillation': _as_float,
+    'avgVerticalRatio': _as_float,
+    'avgGroundContactBalance': _as_float,
+    'minTemperature': _as_float,
+    'maxTemperature': _as_float,
+    'minElevation': _as_float,
+    'maxElevation': _as_float,
+    'avgRespirationRate': _as_float,
+    'minRespirationRate': _as_float,
+    'maxRespirationRate': _as_float,
+    'trainingEffectLabel': _as_str,
+    'aerobicTrainingEffectMessage': _as_str,
+    'anaerobicTrainingEffectMessage': _as_str,
+    'differenceBodyBattery': _as_int,
+    'waterEstimated': _as_float,
+    'fastestSplit_1000': _as_float,
+    'fastestSplit_1609': _as_float,
+    'fastestSplit_5000': _as_float,
+    'fastestSplit_10000': _as_float,
+    'fastestSplit_21098': _as_float,
+    'fastestSplit_42195': _as_float,
+    'isPR': _as_bool,
+    'workoutId': _as_int,
+}
+
+def get_activity_extra_fields(activity):
+    """Extra ActivitySummary start point fields taken from an activity list entry (no API call)."""
+    fields = {'eventType': get_activity_event_type(activity)}
+    for key, convert in ACTIVITY_SUMMARY_EXTRA_FIELDS.items():
+        fields[key] = convert(activity.get(key))
+    return fields
+
+# Fields only available in the activity details (get_activity, one extra request per
+# activity). Fetched when FETCH_SELECTION contains "activity_details".
+ACTIVITY_DETAILS_FIELDS = (
+    'directWorkoutFeel', 'directWorkoutRpe', 'minHR', 'timeZone',
+    'eventCompletionTargetValue', 'eventCompletionTargetUnitType',
+    'eventCustomGoalValue', 'eventCustomGoalUnitType',
+)
+
+def get_activity_details_fields(activity_id):
+    """Post-activity feel/RPE, min HR, time zone and calendar event goal from get_activity."""
+    details = garmin_obj.get_activity(activity_id) or {}
+    summary = details.get('summaryDTO') or {}
+    metadata = details.get('metadataDTO') or {}
+    event_info = metadata.get('calendarEventInfo') or {}
+    time_zone = details.get('timeZoneUnitDTO') or {}
+    return {
+        'directWorkoutFeel': _as_int(summary.get('directWorkoutFeel')),
+        'directWorkoutRpe': _as_int(summary.get('directWorkoutRpe')),
+        'minHR': _as_float(summary.get('minHR')),
+        'timeZone': _as_str(time_zone.get('timeZone')),
+        'eventCompletionTargetValue': _as_float(event_info.get('completionTargetValue')),
+        'eventCompletionTargetUnitType': _as_str(event_info.get('completionTargetUnitType')),
+        'eventCustomGoalValue': _as_float(event_info.get('customGoalValue')),
+        'eventCustomGoalUnitType': _as_str(event_info.get('customGoalUnitType')),
+    }
+
+def fit_message_values(message):
+    """Like fitparse's get_values(), but a field present twice keeps its non-empty value.
+
+    Some FIT files hold a field twice under the same name (e.g. lap
+    enhanced_avg_speed: the real value, then an empty expansion of avg_speed).
+    get_values() keeps the last one, so the real value was lost.
+    """
+    values = {}
+    for field in message.fields:
+        if field.value is not None or field.name not in values:
+            values[field.name] = field.value
+    return values
+
 # %%
 def get_activity_summary(date_str):
     points_list = []
@@ -775,7 +883,6 @@ def get_activity_summary(date_str):
                     'activityName': activity.get('activityName'),
                     'description': activity.get('description'),
                     'activityType': (activity.get('activityType') or {}).get('typeKey',None),
-                    'eventType': get_activity_event_type(activity),
                     'distance': activity.get('distance'),
                     'elevationGain': activity.get('elevationGain'),
                     'elevationLoss': activity.get('elevationLoss'),
@@ -807,6 +914,12 @@ def get_activity_summary(date_str):
                     'vigorousIntensityMinutes': activity.get('vigorousIntensityMinutes'),
                 }
             })
+            points_list[-1]['fields'].update(get_activity_extra_fields(activity))
+            if 'activity_details' in FETCH_SELECTION:
+                try:
+                    points_list[-1]['fields'].update(get_activity_details_fields(activity_id))
+                except Exception as err:
+                    logging.warning(f"Failed to fetch activity details (feel, RPE, event goal) for activity {activity_id}: {err}")
             points_list.append({
                 "measurement":  "ActivitySummary",
                 "time": (datetime.strptime(activity["startTimeGMT"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.UTC) + timedelta(seconds=int(activity.get('elapsedDuration') or activity.get('duration') or 0))).isoformat(),
@@ -1127,10 +1240,11 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                     fit_file_buffer = io.BytesIO(fit_data)
                     fitfile = FitFile(fit_file_buffer)
                     fitfile.parse()
-                    all_records_list = [record.get_values() for record in fitfile.get_messages('record')]
-                    all_sessions_list = [record.get_values() for record in fitfile.get_messages('session')]
-                    all_lengths_list = [record.get_values() for record in fitfile.get_messages('length')]
-                    all_laps_list = [record.get_values() for record in fitfile.get_messages('lap')]
+                    all_records_list = [fit_message_values(record) for record in fitfile.get_messages('record')]
+                    all_sessions_list = [fit_message_values(record) for record in fitfile.get_messages('session')]
+                    all_lengths_list = [fit_message_values(record) for record in fitfile.get_messages('length')]
+                    all_laps_list = [fit_message_values(record) for record in fitfile.get_messages('lap')]
+                    workout_name = next((fit_message_values(record).get('wkt_name') for record in fitfile.get_messages('workout')), None)
                     if len(all_records_list) == 0:
                         raise FileNotFoundError(f"No records found in FIT file for Activity ID {activityID} - Discarding FIT file")
                     else:
@@ -1190,8 +1304,9 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Sport_Profile_Name": session_record.get('unknown_110'), # FIT session field 110 is sport_profile_name as per Garmin fit SDK.
                                     "Pool_Length": session_record.get('pool_length', None),
                                     "Pool_Length_Unit": session_record.get('pool_length_unit', None),
-                                    "Lengths": session_record.get('num_laps', None),
-                                    "Laps": session_record.get('num_lengths', None),
+                                    "Lengths": session_record.get('num_lengths', None),
+                                    "Laps": session_record.get('num_laps', None),
+                                    "Workout_Name": workout_name,
                                     "Aerobic_Training": session_record.get('total_training_effect', None),
                                     "Anaerobic_Training": session_record.get('total_anaerobic_training_effect', None),
                                     "Primary_Benefit": session_record.get('primary_benefit', None),
@@ -1245,7 +1360,7 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Distance": lap_record.get('total_distance', None),
                                     "Ascent": lap_record.get('total_ascent', None),
                                     "Descent": lap_record.get('total_descent', None),
-                                    "Cycles": lap_record.get('total_cycles', None),
+                                    "Cycles": lap_record.get('total_cycles') if lap_record.get('total_cycles') is not None else lap_record.get('total_strides'),
                                     "Avg_Stroke_Distance": lap_record.get('avg_stroke_distance', None),
                                     "Moving_Duration": lap_record.get('total_moving_time', None),
                                     "Standing_Duration": lap_record.get('time_standing', None),
@@ -1255,7 +1370,13 @@ def fetch_activity_GPS(activityIDdict): # Uses FIT file by default, falls back t
                                     "Avg_Power": lap_record.get('avg_power', None),
                                     "Avg_HR": lap_record.get('avg_heart_rate', None),
                                     "Max_HR": lap_record.get('max_heart_rate', None),
-                                    "Avg_Cadence": lap_record.get('avg_cadence', None),
+                                    "Avg_Cadence": lap_record.get('avg_cadence') if lap_record.get('avg_cadence') is not None else lap_record.get('avg_running_cadence'),
+                                    "Avg_Running_Cadence": lap_record.get('avg_running_cadence', None),
+                                    "Normalized_Power": lap_record.get('normalized_power', None),
+                                    "Timer_Time": lap_record.get('total_timer_time', None),
+                                    "Intensity": _as_str(lap_record.get('intensity')),
+                                    "Lap_Trigger": _as_str(lap_record.get('lap_trigger')),
+                                    "Workout_Step_Index": lap_record.get('wkt_step_index', None),
                                     "Avg_Temperature": lap_record.get('avg_temperature', None),
                                     "Avg_Vertical_Oscillation": lap_record.get('avg_vertical_oscillation', None),
                                     "Avg_Stance_Time": lap_record.get('avg_stance_time', None),
